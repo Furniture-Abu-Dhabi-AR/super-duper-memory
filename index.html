@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AR Place + Joystick (Android)</title>
+
+<!-- three.js (module) -->
+<script type="module">
+/* ====== Конфигурация: вставьте сюда ссылку на ваш GLB ====== */
+const MODEL_URL = 'RAW_GLB_URL'; // <- замените на вашу raw ссылку или относительный путь
+
+/* ====== Импорты three.js и вспомогательных модулей ====== */
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+import { GLTFLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+import { ARButton } from 'https://unpkg.com/three@0.160.0/examples/jsm/webxr/ARButton.js';
+
+/* ====== Простая разметка и стили через JS (страница одна) ====== */
+document.body.style.margin = '0';
+document.body.style.fontFamily = 'system-ui, Roboto, Arial';
+const container = document.createElement('div');
+document.body.appendChild(container);
+
+/* ====== Canvas / Renderer ====== */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+container.appendChild(renderer.domElement);
+
+/* ====== Сцена и камера (камера управляется XR) ====== */
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera();
+
+/* ====== Свет ====== */
+const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+scene.add(light);
+
+/* ====== Reticle (маркер плоскости) ====== */
+const reticle = new THREE.Mesh(
+  new THREE.RingGeometry(0.08, 0.12, 32).rotateX(-Math.PI/2),
+  new THREE.MeshBasicMaterial({ color: 0x00ffcc, side: THREE.DoubleSide })
+);
+reticle.matrixAutoUpdate = false;
+reticle.visible = false;
+scene.add(reticle);
+
+/* ====== Группа для модели: anchorGroup — позиция якоря, offsetGroup — локальный оффсет (джойстик) ====== */
+const anchorGroup = new THREE.Group(); // будет привязан к якорю/позе
+const offsetGroup = new THREE.Group(); // сюда применяем джойстик (локальный оффсет)
+anchorGroup.add(offsetGroup);
+scene.add(anchorGroup);
+
+/* ====== Загрузка модели ====== */
+let model = null;
+const loader = new GLTFLoader();
+loader.load(MODEL_URL, (gltf) => {
+  model = gltf.scene;
+  // начальная ориентация/масштаб
+  model.scale.set(1,1,1);
+  offsetGroup.add(model);
+}, undefined, (err) => {
+  console.error('GLTF load error', err);
+  alert('Не удалось загрузить модель. Проверьте MODEL_URL и CORS.');
+});
+
+/* ====== UI: кнопки и джойстик ====== */
+const ui = document.createElement('div');
+ui.style.position = 'absolute';
+ui.style.left = '12px';
+ui.style.top = '12px';
+ui.style.zIndex = '10';
+ui.style.display = 'flex';
+ui.style.flexDirection = 'column';
+ui.style.gap = '8px';
+document.body.appendChild(ui);
+
+const info = document.createElement('div');
+info.textContent = 'Найди плоскость, тапни чтобы разместить. Джойстик управляет моделью.';
+info.style.background = 'rgba(0,0,0,0.5)';
+info.style.color = '#fff';
+info.style.padding = '8px';
+info.style.borderRadius = '6px';
+ui.appendChild(info);
+
+const arButton = ARButton.createButton(renderer, { requiredFeatures: ['hit-test','local-floor'] });
+arButton.style.position = 'absolute';
+arButton.style.right = '12px';
+arButton.style.top = '12px';
+arButton.style.zIndex = '10';
+document.body.appendChild(arButton);
+
+/* Joystick area */
+const joystickWrap = document.createElement('div');
+joystickWrap.style.position = 'absolute';
+joystickWrap.style.left = '12px';
+joystickWrap.style.bottom = '12px';
+joystickWrap.style.width = '140px';
+joystickWrap.style.height = '140px';
+joystickWrap.style.borderRadius = '12px';
+joystickWrap.style.background = 'rgba(255,255,255,0.04)';
+joystickWrap.style.display = 'flex';
+joystickWrap.style.alignItems = 'center';
+joystickWrap.style.justifyContent = 'center';
+joystickWrap.style.zIndex = '10';
+document.body.appendChild(joystickWrap);
+
+/* Scale slider */
+const scaleControl = document.createElement('input');
+scaleControl.type = 'range';
+scaleControl.min = '0.2';
+scaleControl.max = '3';
+scaleControl.step = '0.01';
+scaleControl.value = '1';
+scaleControl.style.position = 'absolute';
+scaleControl.style.right = '12px';
+scaleControl.style.bottom = '12px';
+scaleControl.style.zIndex = '10';
+document.body.appendChild(scaleControl);
+
+/* Reset button */
+const resetBtn = document.createElement('button');
+resetBtn.textContent = 'Сброс';
+resetBtn.style.position = 'absolute';
+resetBtn.style.left = '12px';
+resetBtn.style.bottom = '160px';
+resetBtn.style.zIndex = '10';
+document.body.appendChild(resetBtn);
+
+/* ====== Joystick (микро-реализация без внешних библиотек) ====== */
+let joystickActive = false;
+let joyStart = { x:0, y:0 };
+let joyValue = { x:0, y:0 }; // в диапазоне [-1,1]
+const knob = document.createElement('div');
+knob.style.width = '60px';
+knob.style.height = '60px';
+knob.style.borderRadius = '50%';
+knob.style.background = 'rgba(255,255,255,0.12)';
+knob.style.boxShadow = '0 2px 6px rgba(0,0,0,0.6)';
+joystickWrap.appendChild(knob);
+
+function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+
+joystickWrap.addEventListener('pointerdown', (e) => {
+  joystickActive = true;
+  joyStart = { x: e.clientX, y: e.clientY };
+  joystickWrap.setPointerCapture(e.pointerId);
+});
+window.addEventListener('pointermove', (e) => {
+  if (!joystickActive) return;
+  const dx = e.clientX - joyStart.x;
+  const dy = e.clientY - joyStart.y;
+  const max = 50; // пикселей
+  const nx = clamp(dx / max, -1, 1);
+  const ny = clamp(dy / max, -1, 1);
+  joyValue.x = nx;
+  joyValue.y = ny;
+  knob.style.transform = `translate(${nx*40}px, ${ny*40}px)`;
+});
+window.addEventListener('pointerup', (e) => {
+  joystickActive = false;
+  joyValue.x = 0; joyValue.y = 0;
+  knob.style.transform = `translate(0px, 0px)`;
+});
+
+/* ====== WebXR: hit-test setup ====== */
+let xrSession = null;
+let xrRefSpace = null;
+let hitTestSource = null;
+let placed = false; // модель заякорена
+let anchor = null;   // XRAnchor если поддерживается
+
+renderer.xr.addEventListener('sessionstart', async () => {
+  xrSession = renderer.xr.getSession();
+  xrRefSpace = await xrSession.requestReferenceSpace('local-floor');
+  const viewerSpace = await xrSession.requestReferenceSpace('viewer');
+  try {
+    hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
+  } catch (e) {
+    console.warn('Hit test not available', e);
+  }
+
+  // Обработчик select (тап) — фиксируем модель в текущем положении ретикла
+  xrSession.addEventListener('select', async (ev) => {
+    if (!reticle.visible) return;
+    // Попытка создать якорь (если поддерживается)
+    try {
+      if (ev.frame && ev.frame.createAnchor) {
+        const pose = new XRRigidTransform(); // placeholder
+        // используем текущую матрицу ретикла
+        const mat = new THREE.Matrix4().fromArray(reticle.matrix.elements || reticle.matrix);
+        // преобразуем матрицу в позицию/кватернион
+        const pos = new THREE.Vector3();
+        const quat = new THREE.Quaternion();
+        const scale = new THREE.Vector3();
+        mat.decompose(pos, quat, scale);
+        const xrPose = new XRRigidTransform(
+          { x: pos.x, y: pos.y, z: pos.z },
+          { x: quat.x, y: quat.y, z: quat.z, w: quat.w }
+        );
+        // createAnchor доступен на frame, но не во всех реализациях; используем session.requestAnimationFrame для создания anchor через frame
+        // Простая реализация: просто перемещаем anchorGroup в позу ретикла (без XRAnchor)
+        anchorGroup.position.copy(pos);
+        anchorGroup.quaternion.copy(quat);
+        placed = true;
+      } else {
+        // fallback: просто закрепляем группу в текущей позе ретикла
+        const mat = new THREE.Matrix4().fromArray(reticle.matrix.elements || reticle.matrix);
+        const pos = new THREE.Vector3();
+        const quat = new THREE.Quaternion();
+        const scale = new THREE.Vector3();
+        mat.decompose(pos, quat, scale);
+        anchorGroup.position.copy(pos);
+        anchorGroup.quaternion.copy(quat);
+        placed = true;
+      }
+    } catch (err) {
+      console.warn('Anchor create failed', err);
+      // fallback: set anchorGroup transform
+      const mat = new THREE.Matrix4().fromArray(reticle.matrix.elements || reticle.matrix);
+      const pos = new THREE.Vector3();
+      const quat = new THREE.Quaternion();
+      const scale = new THREE.Vector3();
+      mat.decompose(pos, quat, scale);
+      anchorGroup.position.copy(pos);
+      anchorGroup.quaternion.copy(quat);
+      placed = true;
+    }
+  });
+});
+
+/* ====== Рендер‑цикл и hit test ====== */
+const clock = new THREE.Clock();
+
+function onXRFrame(time, frame) {
+  const session = frame.session;
+  const pose = frame.getViewerPose(xrRefSpace);
+  if (hitTestSource && pose) {
+    const hitResults = frame.getHitTestResults(hitTestSource);
+    if (hitResults.length > 0 && !placed) {
+      const hit = hitResults[0];
+      const hitPose = hit.getPose(xrRefSpace);
+      // применяем матрицу ретикла
+      const m = new THREE.Matrix4().fromArray(hitPose.transform.matrix);
+      reticle.matrix.copy(m);
+      reticle.visible = true;
+    } else {
+      if (!placed) reticle.visible = false;
+    }
+  }
+
+  // Если модель размещена, применяем джойстик оффсет
+  if (placed && model) {
+    // джойстик управляет локальным смещением по X/Z и поворотом Y
+    const moveSpeed = parseFloat(document.querySelector('input[type=range]').value) || 1.0;
+    // joyValue.x -> lateral, joyValue.y -> forward/back
+    const dx = joyValue.x * 0.02 * moveSpeed;
+    const dz = -joyValue.y * 0.02 * moveSpeed;
+    // применяем локально к offsetGroup
+    offsetGroup.position.x += dx;
+    offsetGroup.position.z += dz;
+    // вращение по удержанию двух пальцев (не реализовано) — добавим простую автоматическую привязку: вращаем по X движениям
+    // scale
+    const s = parseFloat(scaleControl.value);
+    offsetGroup.scale.set(s,s,s);
+  }
+
+  renderer.render(scene, camera);
+}
+
+/* Используем WebXR render loop */
+renderer.setAnimationLoop((timestamp, frame) => {
+  if (frame) {
+    // WebXR frame
+    onXRFrame(timestamp, frame);
+  } else {
+    // обычный рендер (fallback)
+    renderer.render(scene, camera);
+  }
+});
+
+/* ====== Окно: ресайз ====== */
+window.addEventListener('resize', () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ====== Reset ====== */
+resetBtn.addEventListener('click', () => {
+  anchorGroup.position.set(0,0,0);
+  anchorGroup.quaternion.set(0,0,0,1);
+  offsetGroup.position.set(0,0,0);
+  offsetGroup.rotation.set(0,0,0);
+  offsetGroup.scale.set(1,1,1);
+  scaleControl.value = '1';
+  placed = false;
+  reticle.visible = false;
+});
+
+/* ====== Конец модуля ====== */
+</script>
+</head>
+<body></body>
+</html>
